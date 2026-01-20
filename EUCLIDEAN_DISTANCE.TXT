@@ -1,0 +1,82 @@
+// === 0. 参数设置 ===
+var bufferDistance = 100; // 缓冲区距离（米）
+var exportScale = 30;    // ✅ 修正：使用 100m 分辨率
+
+// === 1. 加载数据 ===
+var rivers = ee.FeatureCollection('projects/my-first-project1-470406/assets/river_grgb'); 
+var studyArea = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope').geometry(); 
+
+// === 2. 创建缓冲区 ===
+var bufferedRivers = rivers.map(function(feature) {
+  return feature.buffer(bufferDistance);
+});
+
+// === 3. 创建最终栅格 (关键步骤：精确赋值 1, 0, -9999) ===
+
+// A. 绘制河流栅格：河流缓冲区设为 1，其他区域为 NoData
+var riverRaster = ee.Image().paint(bufferedRivers, 1);
+
+// B. 裁剪到研究区边界
+var clippedRaster = riverRaster.clip(studyArea);
+
+// C. 填充研究区内非河流区域：将研究区内原本是 NoData 的区域设为 0
+var innerRaster = clippedRaster.unmask(0);
+
+// D. 填充研究区外区域：将研究区外原本是 NoData 的区域设为 -9999
+var finalRaster = innerRaster.unmask(-9999)
+  .toInt16(); // ✅ 修复：强制转换为 16 位整数类型，确保 1, 0, -9999 都是离散整数
+
+// === 4. 实时显示（可选）===
+Map.centerObject(studyArea, 10); 
+Map.addLayer(bufferedRivers, {color: 'blue'}, 'Buffered Rivers (Vector)'); 
+
+// 注意：为了可视化，-9999 会被当作一个非常小的值。
+Map.addLayer(finalRaster, 
+  {min: -9999, max: 1, palette: ['black', 'white', 'blue'], opacity: 0.7}, 
+  'Final Raster (1=River, 0=NonRiver, -9999 Outside)'); 
+
+// 假设您之前的脚本已经运行完毕，并且存在以下变量：
+// finalRaster: 您的 1/0/-9999 河流栅格
+// studyArea: 您的研究区几何体
+// exportScale: 100 (米)
+
+// ======================================================================
+// === 8. 计算 WATER ROAD 的欧氏距离 (已修正 fastDistanceTransform 参数) ===
+// ======================================================================
+
+// 1. 定义源像元：创建河流二值图，只保留值为 1 的河流像元作为源
+var riverSource = finalRaster.eq(1).unmask(0); // 河流=1，非河流/区域外=0
+
+// 2. 执行快速距离变换
+var distanceImagePixels = riverSource.fastDistanceTransform({
+    units: 'pixels' // ✅ 修正：将 'unit' 改为 'units'
+});
+
+// 3. 转换为米 (meters)
+// 需要对像素距离取平方根，然后乘以实际的像素大小 (100米)
+var distanceImageMeters = distanceImagePixels.sqrt().multiply(exportScale)
+    .rename('Distance_to_River');
+
+// 4. 裁剪到研究区并设置区域外 NoData
+var distanceFinal = distanceImageMeters.clip(studyArea).unmask(-9999)
+    .toInt16(); // 转换为整数类型便于存储
+
+// === 9. 实时显示欧氏距离 ===
+var distanceViz = {
+    min: 0,
+    max: 5000, 
+    palette: ['blue', 'cyan', 'green', 'yellow', 'red']
+};
+Map.addLayer(distanceFinal, distanceViz, 'Euclidean Distance to Water Road (m)'); 
+
+// === 10. 导出欧氏距离栅格 ===
+Export.image.toDrive({
+    image: distanceFinal,
+    description: 'HH_River_Euclidean_Distance_100m',
+    folder: 'GEE_Exports', 
+    fileNamePrefix: 'HH_River_Euclidean_Distance_100m',
+    region: studyArea, 
+    scale: exportScale, // 100m 分辨率
+    crs: 'EPSG:4326', 
+    maxPixels: 1e13 
+});

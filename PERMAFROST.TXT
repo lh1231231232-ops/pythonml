@@ -1,0 +1,131 @@
+// =============================================================================
+// Permafrost Degradation 冻土退化 (ALT Estimate) for Landslide Susceptibility Analysis
+// =============================================================================
+
+// 导入研究区边界 (请确保这个 FeatureCollection 已经上传并可以访问)
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope');
+
+// 定义目标分辨率，统一所有输入数据的尺度 (100米)
+var TARGET_SCALE = 30;
+var NO_DATA_VAL = -9999;
+
+// ------------------------------------------------
+// 1. 数据加载与预处理 (统一尺度)
+// ------------------------------------------------
+
+// 加载 MODIS LST 数据（作为温度驱动）
+var modisLST = ee.ImageCollection('MODIS/061/MOD11A1')
+    .filterBounds(boundary)
+    .filterDate('1995-01-01', '2025-12-31')
+    .select('LST_Day_1km')
+    .map(function(image) {
+        // 转换为摄氏度并重采样到目标分辨率
+        return image.multiply(0.02)
+            .subtract(273.15)
+            .rename('LST_Celsius')
+            .reproject({
+                crs: image.projection(), // 使用原始投影，但指定新尺度
+                scale: TARGET_SCALE
+            });
+    });
+
+// 计算多年均值 LST
+var modisLSTMean = modisLST.mean().clip(boundary);
+
+// 加载 SMAP 土壤湿度（0-10cm 层，作为湿度驱动）
+var smapSoilMoisture = ee.ImageCollection('NASA/SMAP/SPL4SMGP/007')
+    .filterBounds(boundary)
+    .filterDate('2015-03-31', '2023-12-31')
+    .select('sm_surface')
+    .map(function(image) {
+        // 转换为百分比并重采样到目标分辨率
+        return image.multiply(100)
+            .rename('SoilMoisture')
+            .reproject({
+                crs: image.projection(), // 使用原始投影，但指定新尺度
+                scale: TARGET_SCALE
+            });
+    });
+
+// 计算多年均值土壤湿度
+var smapSoilMoistureMean = smapSoilMoisture.mean().clip(boundary);
+
+
+// ------------------------------------------------
+// 2. 估算活跃层厚度 (ALT)
+// ------------------------------------------------
+
+// 确保两个均值图像具有相同的分辨率和投影信息
+var LST_resampled = modisLSTMean.resample('bilinear').reproject(modisLSTMean.projection().atScale(TARGET_SCALE));
+var SM_resampled = smapSoilMoistureMean.resample('bilinear').reproject(smapSoilMoistureMean.projection().atScale(TARGET_SCALE));
+
+
+// 估算活跃层厚度 (ALT)：简化模型 ALT = max(0, LST * 0.1 + Moisture * 0.005)
+var estimatedALT = LST_resampled.multiply(0.1)
+    .add(SM_resampled.multiply(0.005))
+    .max(0) // 最小值不能低于 0
+    .clamp(0, 2) // ALT 范围 0-2 米
+    .rename('Estimated_ALT')
+    .clip(boundary);
+
+
+// ------------------------------------------------
+// 3. 可视化与检查
+// ------------------------------------------------
+
+// 定义可视化参数
+var altVis = {
+    min: 0,
+    max: 2,
+    palette: ['#0000FF', '#00FF00', '#FFFF00', '#FF0000'] // 蓝(浅) -> 绿 -> 黄 -> 红(深)
+};
+
+// 实时显示估算 ALT (此步骤已是最优化，但仍需等待 GEE 完成后台计算)
+Map.addLayer(estimatedALT, altVis, 'Estimated Permafrost ALT', true);
+
+// 定位地图到河湟谷地
+Map.centerObject(boundary, 10);
+
+
+// **************** 导致内存超限的代码块 - 已注释掉 ****************
+/*
+var STATS_SCALE = 1000; 
+print('Calculating stats using scale: ' + STATS_SCALE + 'm to avoid memory error...');
+
+var permafrostStats = estimatedALT.reduceRegion({
+    reducer: ee.Reducer.minMax().combine({
+        reducer2: ee.Reducer.mean(),
+        sharedInputs: true
+    }),
+    geometry: boundary.geometry(),
+    // 关键改变：使用更粗的分辨率计算统计
+    scale: STATS_SCALE, 
+    maxPixels: 1e13
+});
+print('Estimated Permafrost ALT MinMax and Mean (using ' + STATS_SCALE + 'm scale)', permafrostStats);
+*/
+// *******************************************************************
+
+
+// ------------------------------------------------
+// 4. 数据导出
+// ------------------------------------------------
+
+// 准备导出图像：使用 NO_DATA_VAL 进行掩膜
+var exportPermafrost = estimatedALT.unmask(NO_DATA_VAL);
+
+// 导出 GeoTIFF 到 Google Drive (这是一个异步任务，通常不会内存超限)
+Export.image.toDrive({
+    image: exportPermafrost,
+    description: 'HHG_Estimated_Permafrost_ALT_100m',
+    folder: 'Hehuang_slide',
+    // 最终输出分辨率保持 100m
+    scale: TARGET_SCALE, 
+    region: boundary.geometry(),
+    maxPixels: 1e13,
+    crs: 'EPSG:4326', // 指定最终输出的 CRS
+    fileFormat: 'GeoTIFF',
+    formatOptions: {
+        noData: NO_DATA_VAL
+    }
+});

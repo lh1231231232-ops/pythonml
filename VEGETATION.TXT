@@ -1,0 +1,117 @@
+// 加載湟水谷地邊界
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope');
+
+// 加載植被/土地覆蓋數據（GOOGLE/DYNAMICWORLD/V1，2023年）
+var collection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+    .filterDate('2023-01-01', '2023-12-31')
+    .select('label'); // 選擇分類波段（0-8）
+
+// 打印集合長度檢查
+print('Vegetation Collection size:', collection.size());
+
+// 將集合轉為單張影像（使用 mode 取眾數）
+var vegetation = collection.mode().clip(boundary);
+
+// 重投影到 WGS84，100米分辨率
+var resampledVeg = vegetation.reproject({
+  crs: 'EPSG:4326',
+  scale: 30
+});
+
+// 可視化邊界（先添加，避免覆蓋植被）
+Map.addLayer(boundary, {
+  color: 'blue',
+  fillColor: 'transparent',
+  width: 2
+}, 'Boundary', false);
+
+// 可視化植被/土地覆蓋（後添加，默認顯示）
+Map.addLayer(resampledVeg, {
+  min: 0,
+  max: 8,
+  palette: [
+    '419bdf', // 0: 水體 (Water)
+    '397d49', // 1: 樹木 (Trees)
+    '88b053', // 2: 草地 (Grass)
+    '7a87c6', // 3: 淹沒植被 (Flooded Vegetation)
+    'e49635', // 4: 農作物 (Crops)
+    'c4281b', // 5: 灌木叢 (Shrub and Scrub)
+    'a59b8f', // 6: 建築 (Built)
+    'b39fe1', // 7: 裸地 (Bare)
+    'd7d7d7'  // 8: 雪/冰 (Snow and Ice)
+  ],
+  opacity: 0.9, // 略透明，便於與其他圖層疊加
+  maxPixels: 1e10
+}, 'Vegetation Types', true);
+
+// 定位地圖到湟水谷地
+Map.centerObject(boundary, 10);
+
+// 計算植被/土地覆蓋分佈（頻率直方圖）
+var vegHistogram = resampledVeg.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: boundary.geometry(),
+  scale: 100,
+  maxPixels: 1e10
+});
+print('Vegetation Histogram', vegHistogram); // 輸出植被/土地覆蓋類別分佈
+
+// 驗證植被數據值範圍
+var vegStats = resampledVeg.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: boundary.geometry(),
+  scale: 100,
+  maxPixels: 1e10
+});
+print('Vegetation Data MinMax', vegStats); // 檢查值範圍（應為0-8）
+
+// 定義NoData值（選擇一個不在植被類別範圍內的值，例如-9999）
+var noDataVal = -9999;
+
+// 將研究區外的masked像素替換為NoData值
+var exportVeg = resampledVeg.unmask(noDataVal);
+
+// 導出前可視化檢查：確認研究區外的像素是否正確設置為-9999
+Map.addLayer(exportVeg.eq(noDataVal), {palette: ['black']}, 'Vegetation NoData Check', false); // 黑色表示NoData區域
+
+// 實時可視化：檢查有效數據分佈
+// 創建一個二值掩膜，僅顯示研究區內的有效數據（排除NoData）
+var validMask = resampledVeg.neq(noDataVal);
+// 使用 updateMask 使值為0的像素（研究區外）透明，值為1的像素顯示為白色
+Map.addLayer(validMask.updateMask(validMask), {palette: ['white'], opacity: 0.5}, 'Valid Data Mask', false); // 白色表示有效數據，默認不顯示
+
+// 檢查掩膜值分佈（確認validMask是否正確生成0和1）
+var maskStats = validMask.reduceRegion({
+  reducer: ee.Reducer.minMax().combine({
+    reducer2: ee.Reducer.mean(),
+    sharedInputs: true
+  }),
+  geometry: boundary.geometry(),
+  scale: 100,
+  maxPixels: 1e10
+});
+print('Valid Mask Statistics', maskStats); // 輸出掩膜統計，應為0（無效）或1（有效）
+
+// 實時可視化：植被/土地覆蓋分級（簡化為主要類型，適用於滑坡易發性分析）
+var vegClasses = ee.Image(0)
+  .where(resampledVeg.eq(0), 1) // 水體
+  .where(resampledVeg.eq(1).or(resampledVeg.eq(2).or(resampledVeg.eq(3))), 2) // 植被（樹木、草地、淹沒植被）
+  .where(resampledVeg.eq(4).or(resampledVeg.eq(5)), 3) // 農田/灌木叢
+  .where(resampledVeg.eq(6), 4) // 城市（建築）
+  .where(resampledVeg.eq(7).or(resampledVeg.eq(8)), 5); // 裸地/雪冰
+Map.addLayer(vegClasses, {min: 1, max: 5, palette: ['blue', 'green', 'yellow', 'red', 'gray']}, 'Vegetation Classes', false);
+
+// 導出 GeoTIFF 到 Google Drive，明確指定NoData值
+Export.image.toDrive({
+  image: exportVeg,
+  description: 'HHG_Vegetation_100m',
+  folder: 'GEE_Exports',
+  scale: 30,
+  region: boundary.geometry(),
+  maxPixels: 1e10,
+  crs: 'EPSG:4326', // 確保投影一致
+  fileFormat: 'GeoTIFF',
+  formatOptions: {
+    noData: noDataVal // 指定GeoTIFF的NoData值
+  }
+});

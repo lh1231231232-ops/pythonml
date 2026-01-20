@@ -1,0 +1,163 @@
+// =============================================================================
+// 1. NDVI (归一化植被指数)
+// =============================================================================
+
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope'); 
+
+// 加载 Sentinel-2 影像集合
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(boundary)
+  .filterDate('2023-01-01', '2023-12-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10)); // 过滤掉云量超过10%的影像
+
+// 定义云掩膜函数（使用QA60波段去除云和卷云）
+var addCloudMask = function(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10; // 密集云位
+  var cirrusBitMask = 1 << 11; // 卷云位
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+               .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask);
+};
+
+// 应用云掩膜
+s2 = s2.map(addCloudMask);
+
+// 打印集合长度检查
+print('Sentinel-2 Collection size for NDVI (after cloud mask):', s2.size());
+
+// 定义NDVI计算函数
+var addNDVI = function(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi);
+};
+
+// 定义NDSI计算函数（雪指数）
+var addNDSI = function(image) {
+  var ndsi = image.normalizedDifference(['B3', 'B11']).rename('NDSI');
+  return image.addBands(ndsi);
+};
+
+// 应用NDVI和NDSI计算
+var s2WithNDVI = s2.map(addNDVI);
+var s2WithNDSI = s2.map(addNDSI);
+
+// 将集合转为单张影像（使用 median 取中值，并提前裁剪到边界）
+var ndvi = s2WithNDVI.select('NDVI').median().clip(boundary);
+var ndsi = s2WithNDSI.select('NDSI').median().clip(boundary);
+
+// 交叉验证：使用NDSI排除雪/冰区域（NDSI > 0.4 且 NIR < 0.11 表示雪/冰）
+var nir = s2.select('B8').median().clip(boundary); // NIR波段 (B8)
+var snowMask = ndsi.gt(0.4).and(nir.lt(0.11)); // 雪/冰掩膜（1为雪/冰）
+
+// 应用交叉验证：从NDVI中排除雪/冰区域
+var refinedNDVI = ndvi.updateMask(snowMask.not()); // 仅保留非雪/冰像素
+
+// 重投影到 WGS84，120米分辨率（备选：100米或200米，见注释）
+var resampledNDVI = refinedNDVI.reproject({
+  crs: 'EPSG:4326',
+  scale: 30 // 如果仍超限，可尝试 scale: 200；若内存充足，可用 scale: 100
+});
+
+// 可视化边界（先添加，避免覆盖NDVI）
+Map.addLayer(boundary, {
+  color: 'blue',
+  fillColor: '00000000', // 完全透明
+  width: 2
+}, 'Boundary', false);
+
+// 可视化精炼后的NDVI（默认显示）
+Map.addLayer(resampledNDVI, {
+  min: -1,
+  max: 1,
+  palette: ['blue', 'white', 'green'], // 蓝色（低NDVI）到绿色（高NDVI）
+  opacity: 0.9,
+  maxPixels: 1e10
+}, 'Refined NDVI', true);
+
+// 可视化NDSI（可选，用于检查）
+Map.addLayer(ndsi.reproject({crs: 'EPSG:4326', scale: 120}), {
+  min: -1,
+  max: 1,
+  palette: ['black', 'white'], // 黑色（低NDSI）到白色（高NDSI，雪/冰）
+  opacity: 0.9
+}, 'NDSI', false);
+
+// 可视化雪/冰掩膜（修复：使用有效颜色）
+Map.addLayer(snowMask.reproject({crs: 'EPSG:4326', scale: 120}), {
+  palette: ['#000000', '#FFFFFF'], // 黑色（非雪）到白色（雪/冰）
+  opacity: 0.7 // 降低透明度以便叠加查看
+}, 'Snow/Ice Mask', false);
+
+// 定位地图到湟水谷地
+Map.centerObject(boundary, 10);
+
+// 计算精炼NDVI统计（频度直方图）
+var ndviHistogram = resampledNDVI.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram().unweighted(),
+  geometry: boundary.geometry(),
+  scale: 120, // 匹配重投影分辨率
+  maxPixels: 1e10
+});
+print('Refined NDVI Histogram', ndviHistogram); // 输出NDVI分布
+
+// 验证精炼NDVI值范围
+var ndviStats = resampledNDVI.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: boundary.geometry(),
+  scale: 120,
+  maxPixels: 1e10
+});
+print('Refined NDVI MinMax', ndviStats); // 检查值范围（应为-1到1）
+
+// 计算NDSI统计（用于验证雪/冰检测）
+var ndsiStats = ndsi.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: boundary.geometry(),
+  scale: 120,
+  maxPixels: 1e10
+});
+print('NDSI MinMax', ndsiStats);
+
+// 定义NoData值（选择一个不在NDVI范围内的值，例如-9999）
+var noDataVal = -9999;
+
+// 将研究区外的masked像素替换为NoData值
+var exportNDVI = resampledNDVI.unmask(noDataVal);
+
+// 导出前可视化检查：确认研究区外的像素是否正确设置为-9999
+Map.addLayer(exportNDVI.eq(noDataVal), {palette: ['black']}, 'NDVI NoData Check', false); // 黑色表示NoData区域
+
+// 实时可视化：检查有效数据分布（优化：降低分辨率）
+var validMask = resampledNDVI.neq(noDataVal);
+Map.addLayer(validMask.updateMask(validMask).reproject({crs: 'EPSG:4326', scale: 120}), {
+  palette: ['white'],
+  opacity: 0.5
+}, 'Valid Data Mask', false); // 白色表示有效数据，默认不显示
+
+// 检查掩膜值分布
+var maskStats = validMask.reduceRegion({
+  reducer: ee.Reducer.minMax().combine({
+    reducer2: ee.Reducer.mean(),
+    sharedInputs: true
+  }),
+  geometry: boundary.geometry(),
+  scale: 30,
+  maxPixels: 1e10
+});
+print('Valid Mask Statistics', maskStats); // 输出掩膜统计，检查是否为0（无效）或1（有效）
+
+// 导出 GeoTIFF 到 Google Drive
+Export.image.toDrive({
+  image: exportNDVI,
+  description: 'HHG_NDVI_120m_Refined',
+  folder: 'GEE_Exports',
+  scale: 30, // 匹配重投影分辨率
+  region: boundary.geometry(),
+  maxPixels: 1e10,
+  crs: 'EPSG:4326',
+  fileFormat: 'GeoTIFF',
+  formatOptions: {
+    noData: noDataVal // 指定GeoTIFF的NoData值
+  }
+});

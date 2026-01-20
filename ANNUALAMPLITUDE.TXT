@@ -1,0 +1,57 @@
+// =============================================================================
+// LST 年振幅 (LST Annual Amplitude) 计算
+// =============================================================================
+
+// 导入研究区边界
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope');
+
+// 定义统一的日期和分辨率
+var START_DATE = '1995-01-01'; 
+var END_DATE = '2025-12-31';
+var TARGET_SCALE = 30;
+var NO_DATA_VAL = -9999;
+
+// 1. 加载和预处理 LST 数据（计算每天的摄氏度 LST）
+var modisLST = ee.ImageCollection('MODIS/061/MOD11A1')
+    .filterBounds(boundary)
+    .filterDate(START_DATE, END_DATE)
+    .select('LST_Day_1km')
+    .map(function(image) {
+        // 转换为摄氏度
+        return image.multiply(0.02).subtract(273.15).rename('LST_Celsius');
+    });
+
+// 2. 计算多年的 LST 最大值和最小值
+var lstMax = modisLST.max();
+var lstMin = modisLST.min();
+
+// 3. 计算 LST 年振幅 (Amplitude)
+var lstAmplitude = lstMax.subtract(lstMin)
+    .rename('LST_Annual_Amplitude')
+    .clip(boundary);
+
+// 4. 可视化
+var ampVis = {
+    min: 20, // 最小振幅 (例如 20°C)
+    max: 60, // 最大振幅 (例如 60°C)
+    palette: ['#4B0082', '#0000FF', '#00FF00', '#FFFF00', '#FF0000'] // 冷->暖->热
+};
+Map.addLayer(lstAmplitude, ampVis, 'LST Annual Amplitude', true);
+Map.centerObject(boundary, 10);
+
+// 5. 导出数据 (使用 100m 精度)
+Export.image.toDrive({
+    image: lstAmplitude.unmask(NO_DATA_VAL),
+    description: 'HHG_LST_Annual_Amplitude_100m',
+    folder: 'Hehuang_slide',
+    scale: TARGET_SCALE, 
+    region: boundary.geometry(),
+    maxPixels: 1e13,
+    crs: 'EPSG:4326',
+    fileFormat: 'GeoTIFF',
+    formatOptions: {
+        noData: NO_DATA_VAL
+    }
+});
+
+// ********** 注意：统计计算（reduceRegion）已省略，避免内存超限。 **********

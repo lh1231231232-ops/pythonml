@@ -1,0 +1,62 @@
+// =============================================================================
+// 地温变率 (LSTV) 计算 (最终修正：使用开尔文 K 避免负值，并裁剪)
+// =============================================================================
+
+// 导入研究区边界
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope');
+
+// 定义统一的日期和分辨率
+var START_DATE = '1995-01-01'; 
+var END_DATE = '2025-12-31';
+var TARGET_SCALE = 30;
+var NO_DATA_VAL = -9999;
+
+// 1. 加载和预处理 LST 数据 (使用开尔文 K)
+var modisLST_K = ee.ImageCollection('MODIS/061/MOD11A1')
+    .filterBounds(boundary)
+    .filterDate(START_DATE, END_DATE)
+    .select('LST_Day_1km') // 使用日间 LST
+    .map(function(image) {
+        // 转换为开尔文 K (原数据 LST * 0.02)
+        var lstK = image.multiply(0.02).rename('LST_Kelvin');
+        return lstK.updateMask(lstK.gt(0)); // 排除 LST 0 值
+    });
+
+// 2. 计算 LSTV 的三个组成部分 (在开尔文 K 下进行)
+var lstMax = modisLST_K.max();
+var lstMin = modisLST_K.min();
+var lstMean = modisLST_K.mean();
+
+// 3. 计算 LSTV
+// LST 年振幅 = LST_Max - LST_Min (在 K 尺度上振幅和 C 尺度上相同)
+var lstAmplitude = lstMax.subtract(lstMin); 
+// LSTV = 振幅 / 年均值 (分母是 K，确保为正值)
+var lstV = lstAmplitude.divide(lstMean).rename('LST_Variability');
+
+// ** 关键修正：在最终输出前进行裁剪 **
+var lstV_Clipped = lstV.clip(boundary);
+
+// 4. 可视化
+var lstVVis = {
+    // 预期 K 尺度下的变率会落在 0 到 0.25 之间，需要调整可视化范围
+    min: 0.05, 
+    max: 0.25, 
+    palette: ['#00FF00', '#FFFF00', '#FF0000', '#800080'] 
+};
+Map.addLayer(lstV_Clipped, lstVVis, 'LST Variability (LSTV) - K Fixed', true);
+Map.centerObject(boundary, 10);
+
+// 5. 导出数据 (使用 100m 精度)
+Export.image.toDrive({
+    image: lstV_Clipped.unmask(NO_DATA_VAL), // 使用裁剪后的图像导出
+    description: 'HHG_LST_Variability_100m_2010_2023_K_Fixed',
+    folder: 'Hehuang_slide',
+    scale: TARGET_SCALE, 
+    region: boundary.geometry(),
+    maxPixels: 1e13,
+    crs: 'EPSG:4326',
+    fileFormat: 'GeoTIFF',
+    formatOptions: {
+        noData: NO_DATA_VAL
+    }
+});

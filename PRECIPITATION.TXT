@@ -1,0 +1,94 @@
+// 加載河湟谷地邊界
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope');
+
+// 加載 TerraClimate 數據集
+var terraClimate = ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+  .select('pr')
+  .filterDate('2000-01-01', '2023-12-31');
+
+// 計算年均降水量
+var years = ee.List.sequence(1995, 2025);
+var annualPrecip = ee.ImageCollection.fromImages(
+  years.map(function(year) {
+    var start = ee.Date.fromYMD(year, 1, 1);
+    var end = ee.Date.fromYMD(year, 12, 31);
+    return terraClimate.filterDate(start, end)
+      .sum()
+      .set('year', year)
+      .set('system:time_start', start.millis());
+  })
+);
+
+// 計算多年平均並裁剪
+var meanPrecip = annualPrecip.mean().clip(boundary);
+
+// 可視化多年平均降水量（設置為默認顯示）
+var precipVis = {
+  min: 0,
+  max: 800, // 河湟谷地降水範圍（單位：mm/年）
+  palette: ['blue', 'green', 'yellow', 'red'],
+  opacity: 0.8 // 略透明，便於與其他圖層疊加
+};
+Map.addLayer(meanPrecip, precipVis, 'Mean Annual Precipitation', true); // 默認顯示
+Map.centerObject(boundary, 8); // 縮放級別8適合河湟谷地全貌
+
+// 計算降水量統計（min, max, mean）
+var precipStats = meanPrecip.reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.minMax(),
+    sharedInputs: true
+  }),
+  geometry: boundary.geometry(),
+  scale: 4000,
+  maxPixels: 50000000
+});
+print('Precipitation Stats (mm/year)', precipStats); // 輸出降水統計
+
+// 定義NoData值（選擇一個不在降水有效範圍內的值，例如-9999）
+var noDataVal = -9999;
+
+// 將研究區外的masked像素替換為NoData值
+var exportPrecip = meanPrecip.unmask(noDataVal);
+
+// 導出前可視化檢查：確認研究區外的像素是否正確設置為-9999
+Map.addLayer(exportPrecip.eq(noDataVal), {palette: ['black']}, 'Precip NoData Check', false); // 黑色表示NoData區域
+
+// 實時可視化：檢查有效數據分佈
+// 創建一個二值掩膜，僅顯示研究區內的有效數據（排除NoData）
+var validMask = meanPrecip.neq(noDataVal);
+// 使用 updateMask 使值為0的像素（研究區外）透明，值為1的像素顯示為白色
+Map.addLayer(validMask.updateMask(validMask), {palette: ['white'], opacity: 0.7}, 'Valid Data Mask', false); // 白色表示有效數據，默認不顯示
+
+// 檢查掩膜值分佈（確認validMask是否正確生成0和1）
+var maskStats = validMask.reduceRegion({
+  reducer: ee.Reducer.minMax().combine({
+    reducer2: ee.Reducer.mean(),
+    sharedInputs: true
+  }),
+  geometry: boundary.geometry(),
+  scale: 4000,
+  maxPixels: 50000000
+});
+print('Valid Mask Statistics', maskStats); // 輸出掩膜統計，應為0（無效）或1（有效）
+
+// 實時可視化：降水分級（根據河湟谷地降水範圍，假設分為低、中、高）
+var precipClasses = ee.Image(0)
+  .where(meanPrecip.lte(200), 1) // 低降水：<=200mm/年
+  .where(meanPrecip.gt(200).and(meanPrecip.lte(500)), 2) // 中降水：200-500mm/年
+  .where(meanPrecip.gt(500), 3); // 高降水：>500mm/年
+Map.addLayer(precipClasses, {min: 1, max: 3, palette: ['blue', 'green', 'red']}, 'Precip Classes', false);
+
+// 導出 GeoTIFF 到 Google Drive，明確指定NoData值
+Export.image.toDrive({
+  image: exportPrecip,
+  description: 'HHG_Mean_Annual_Precipitation_2000_2023',
+  folder: 'GEE_Exports',
+  scale: 4000, // 4公里分辨率
+  region: boundary.geometry(),
+  maxPixels: 50000000,
+  crs: 'EPSG:4326', // 確保投影一致
+  fileFormat: 'GeoTIFF',
+  formatOptions: {
+    noData: noDataVal // 指定GeoTIFF的NoData值
+  }
+});

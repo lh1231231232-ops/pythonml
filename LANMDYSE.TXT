@@ -1,0 +1,98 @@
+// 加載河湟谷地邊界
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope');
+
+// 加載 ESA WorldCover v100 數據集（100米分辨率）
+var lulcCollection = ee.ImageCollection('ESA/WorldCover/v100')
+    .filterDate('1995-01-01', '2025-12-31') // 根據年份篩選
+    .first() // 獲取第一張影像
+    .select('Map'); // 選擇分類圖層
+
+// 裁剪到河湟谷地邊界
+var clippedLulc = lulcCollection.clip(boundary);
+
+// 重採樣到100米（確保投影一致）
+var resampledLulc = clippedLulc.reproject({
+  crs: 'EPSG:4326',
+  scale: 30
+});
+
+// 可視化土地利用（ESA WorldCover調色板，默認顯示）
+Map.addLayer(resampledLulc, {
+  min: 10,
+  max: 100,
+  palette: [
+    '006400', // 10: 樹木覆蓋
+    'ffbb22', // 20: 灌木
+    'ffff4c', // 30: 草地
+    'f096ff', // 40: 農田
+    'fa0000', // 50: 建築
+    'b4b4b4', // 60: 裸地/稀疏植被
+    'f0f0f0', // 70: 雪/冰
+    'dec5c5', // 80: 水體
+    'ff0000', // 90: 濕地
+    '0000ff'  // 100: 其他（根據ESA WorldCover）
+  ],
+  opacity: 0.9 // 略透明，便於與其他圖層疊加
+}, 'Land Use', true);
+Map.centerObject(boundary, 8); // 縮放級別8適合河湟谷地全貌
+
+// 計算土地利用分佈（頻率直方圖）
+var lulcHistogram = resampledLulc.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: boundary.geometry(),
+  scale: 30,
+  maxPixels: 1e9
+});
+print('Land Use Histogram', lulcHistogram); // 輸出土地利用類別分佈
+
+// 定義NoData值（選擇一個不在土地利用類別範圍內的值，例如-9999）
+var noDataVal = -9999;
+
+// 將研究區外的masked像素替換為NoData值
+var exportLulc = resampledLulc.unmask(noDataVal);
+
+// 導出前可視化檢查：確認研究區外的像素是否正確設置為-9999
+Map.addLayer(exportLulc.eq(noDataVal), {palette: ['black']}, 'Land Use NoData Check', false); // 黑色表示NoData區域
+
+// 實時可視化：檢查有效數據分佈
+// 創建一個二值掩膜，僅顯示研究區內的有效數據（排除NoData）
+var validMask = resampledLulc.neq(noDataVal);
+// 使用 updateMask 使值為0的像素（研究區外）透明，值為1的像素顯示為白色
+Map.addLayer(validMask.updateMask(validMask), {palette: ['white'], opacity: 0.5}, 'Valid Data Mask', false); // 白色表示有效數據，默認不顯示
+
+// 檢查掩膜值分佈（確認validMask是否正確生成0和1）
+var maskStats = validMask.reduceRegion({
+  reducer: ee.Reducer.minMax().combine({
+    reducer2: ee.Reducer.mean(),
+    sharedInputs: true
+  }),
+  geometry: boundary.geometry(),
+  scale: 30,
+  maxPixels: 1e9
+});
+print('Valid Mask Statistics', maskStats); // 輸出掩膜統計，應為0（無效）或1（有效）
+
+// 實時可視化：土地利用分級（根據ESA WorldCover類別，分為主要類型）
+var lulcClasses = ee.Image(0)
+  .where(resampledLulc.eq(10), 1) // 森林（樹木覆蓋）
+  .where(resampledLulc.eq(20).or(resampledLulc.eq(30)), 2) // 灌木/草地
+  .where(resampledLulc.eq(40), 3) // 農田
+  .where(resampledLulc.eq(50), 4) // 城市（建築）
+  .where(resampledLulc.eq(60).or(resampledLulc.eq(70)), 5) // 裸地/雪冰
+  .where(resampledLulc.eq(80).or(resampledLulc.eq(90)), 6); // 水體/濕地
+Map.addLayer(lulcClasses, {min: 1, max: 6, palette: ['green', 'yellow', 'orange', 'red', 'gray', 'blue']}, 'Land Use Classes', false);
+
+// 導出 GeoTIFF 到 Google Drive，明確指定NoData值
+Export.image.toDrive({
+  image: exportLulc,
+  description: 'HHG_Land_Use_100m',
+  folder: 'GEE_Exports',
+  scale: 30,
+  region: boundary.geometry(),
+  maxPixels: 1e9,
+  crs: 'EPSG:4326', // 確保投影一致
+  fileFormat: 'GeoTIFF',
+  formatOptions: {
+    noData: noDataVal // 指定GeoTIFF的NoData值
+  }
+});

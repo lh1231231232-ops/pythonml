@@ -1,0 +1,61 @@
+// 加載湟水谷地邊界
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope');
+
+// 加載SRTM DEM（30m分辨率）
+var dem = ee.Image('NASA/NASADEM_HGT/001')
+  .select('elevation')
+  .clip(boundary);
+
+// 裁剪到湟水谷地邊界
+var clippedDEM = dem.clip(boundary);
+
+// 實時可視化高程（根據湟水谷地海拔範圍，假設1000-4000m）
+Map.addLayer(clippedDEM, {min: 1000, max: 4000, palette: ['blue', 'green', 'yellow', 'red']}, 'DEM');
+Map.centerObject(boundary, 8); // 縮放級別8適合湟水谷地全貌
+
+// 計算高程統計（min, max, mean）
+var demStats = clippedDEM.reduceRegion({
+  reducer: ee.Reducer.minMax().combine({
+    reducer2: ee.Reducer.mean(),
+    sharedInputs: true
+  }),
+  geometry: boundary.geometry(),
+  scale: 30,
+  maxPixels: 1e9
+});
+print('DEM Statistics', demStats); // 輸出高程統計
+
+// 定義NoData值（選擇一個不在高程有效範圍內的值，例如-9999）
+var noDataVal = -9999;
+
+// 將研究區外的masked像素替換為NoData值
+var exportDEM = clippedDEM.unmask(noDataVal);
+
+// 導出前可視化檢查：確認研究區外的像素是否正確設置為-9999
+Map.addLayer(exportDEM.eq(noDataVal), {palette: ['black']}, 'DEM NoData Check', false); // 黑色表示NoData區域，false表示默認不顯示
+
+// 導出高程圖像到Google Drive，明確指定GeoTIFF的NoData值
+Export.image.toDrive({
+  image: exportDEM,
+  description: 'HHG_DEM',
+  scale: 30,
+  region: boundary.geometry(),
+  maxPixels: 1e9,
+  crs: 'EPSG:4326', // 確保投影一致
+  fileFormat: 'GeoTIFF',
+  formatOptions: {
+    noData: noDataVal // 指定GeoTIFF的NoData值
+  }
+});
+
+// 實時可視化：檢查有效數據分佈
+// 創建一個二值掩膜，僅顯示研究區內的有效數據（排除NoData）
+var validMask = clippedDEM.neq(noDataVal);
+Map.addLayer(validMask, {palette: ['white']}, 'Valid Data Mask', false); // 白色表示有效數據區域
+
+// 實時可視化：高程分級（根據湟水谷地海拔範圍，假設分為低、中、高）
+var demClasses = ee.Image(0)
+  .where(clippedDEM.lte(2000), 1) // 低海拔：<=2000m
+  .where(clippedDEM.gt(2000).and(clippedDEM.lte(3000)), 2) // 中海拔：2000-3000m
+  .where(clippedDEM.gt(3000), 3); // 高海拔：>3000m
+Map.addLayer(demClasses, {min: 1, max: 3, palette: ['blue', 'green', 'red']}, 'DEM Classes', false);

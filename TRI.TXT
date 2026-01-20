@@ -1,0 +1,110 @@
+
+// =============================================================================
+// Terrain Ruggedness Index (TRI, 地形粗糙度指数)
+// =============================================================================
+
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope'); 
+
+// 加载 SRTM DEM 数据
+var dem = ee.Image('NASA/NASADEM_HGT/001')
+  .select('elevation')
+  .clip(boundary);
+
+// 计算 TRI (3x3 邻域高程差平方和的平方根)
+var kernel = ee.Kernel.square({radius: 3, units: 'pixels'}); // 3x3 邻域
+var meanElev = dem.reduceNeighborhood({
+  reducer: ee.Reducer.mean(),
+  kernel: kernel
+});
+var tri = dem.subtract(meanElev).pow(2).reduceNeighborhood({
+  reducer: ee.Reducer.sum(),
+  kernel: kernel
+}).sqrt().rename('TRI');
+
+// 重投影到 WGS84，100米分辨率
+var resampledTRI = tri.reproject({
+  crs: 'EPSG:4326',
+  scale: 30
+});
+
+// 可视化边界（先添加，避免覆盖）
+Map.addLayer(boundary, {
+  color: 'blue',
+  fillColor: '00000000', // 完全透明
+  width: 2
+}, 'Boundary', false);
+
+// 可视化 TRI（默认显示，使用较高分辨率降低内存需求）
+Map.addLayer(resampledTRI.reproject({crs: 'EPSG:4326', scale: 200}), {
+  min: 0,
+  max: 50, // TRI 范围根据湟水谷地地形调整（0=平坦，高值=崎岖）
+  palette: ['green', 'yellow', 'red'], // 绿色（平坦）到红色（崎岖）
+  opacity: 0.9,
+  maxPixels: 1e10
+}, 'TRI', true);
+
+// 定位地图到湟水谷地
+Map.centerObject(boundary, 10);
+
+// 计算 TRI 统计（频度直方图，使用较高分辨率降低内存需求）
+var triHistogram = resampledTRI.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram().unweighted(),
+  geometry: boundary.geometry(),
+  scale: 200, // 较高分辨率减少内存需求
+  maxPixels: 1e13 // 增加以避免超限
+});
+print('TRI Histogram', triHistogram); // 输出分布
+
+// 验证 TRI 值范围
+var triStats = resampledTRI.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: boundary.geometry(),
+  scale: 200,
+  maxPixels: 1e13
+});
+print('TRI MinMax', triStats); // 检查值范围（通常 0-50）
+
+// 定义NoData值（选择一个不在 TRI 范围内的值，例如-9999）
+var noDataVal = -9999;
+
+// 将研究区外的masked像素替换为NoData值
+var exportTRI = resampledTRI.unmask(noDataVal);
+
+// 导出前可视化检查：确认研究区外的像素是否正确设置为-9999
+Map.addLayer(exportTRI.eq(noDataVal).reproject({crs: 'EPSG:4326', scale: 200}), {
+  palette: ['black']
+}, 'TRI NoData Check', false); // 黑色表示NoData区域
+
+// 实时可视化：检查有效数据分布
+var validMask = resampledTRI.neq(noDataVal);
+Map.addLayer(validMask.updateMask(validMask).reproject({crs: 'EPSG:4326', scale: 200}), {
+  palette: ['white'],
+  opacity: 0.5
+}, 'Valid Data Mask', false); // 白色表示有效数据，默认不显示
+
+// 检查掩膜值分布
+var maskStats = validMask.reduceRegion({
+  reducer: ee.Reducer.minMax().combine({
+    reducer2: ee.Reducer.mean(),
+    sharedInputs: true
+  }),
+  geometry: boundary.geometry(),
+  scale: 200,
+  maxPixels: 1e13
+});
+print('Valid Mask Statistics', maskStats); // 输出掩膜统计，检查是否为0（无效）或1（有效）
+
+// 导出 GeoTIFF 到 Google Drive（使用实际 100米分辨率）
+Export.image.toDrive({
+  image: exportTRI,
+  description: '_TRI_100m',
+  folder: 'Hehuang_slide', // 更新为您的指定文件夹
+  scale: 30, // 实际导出分辨率
+  region: boundary.geometry(),
+  maxPixels: 1e13,
+  crs: 'EPSG:4326',
+  fileFormat: 'GeoTIFF',
+  formatOptions: {
+    noData: noDataVal // 指定GeoTIFF的NoData值
+  }
+});

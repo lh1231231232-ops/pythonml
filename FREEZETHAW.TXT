@@ -1,0 +1,81 @@
+// =============================================================================
+// 冻融日数 (Freeze-Thaw Days) 计算 (已修正 List Sequence 错误)
+// =============================================================================
+
+// *** 修正：导入研究区边界和定义常量 ***
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope');
+
+var START_DATE = '1995-01-01'; 
+var END_DATE = '2025-12-31';
+var TARGET_SCALE = 30;
+var NO_DATA_VAL = -9999;
+// **********************************
+
+
+// 1. 加载 MODIS LST 日间和夜间数据
+var modisLST_FT = ee.ImageCollection('MODIS/061/MOD11A1')
+    .filterBounds(boundary)
+    .filterDate(START_DATE, END_DATE)
+    .select(['LST_Day_1km', 'LST_Night_1km']);
+
+// 2. 识别冻融日
+var freezeThawDays = modisLST_FT.map(function(image) {
+    // 转换为摄氏度
+    var lstDay = image.select('LST_Day_1km').multiply(0.02).subtract(273.15);
+    var lstNight = image.select('LST_Night_1km').multiply(0.02).subtract(273.15);
+
+    // 冻融条件：日间温度 > 0°C 且 夜间温度 <= 0°C
+    var isFreezeThaw = lstDay.gt(0).and(lstNight.lte(0));
+
+    return isFreezeThaw.rename('FT_Day');
+});
+
+// 3. 计算多年平均的年度冻融日数
+// 定义一个零值图像，用于在集合为空时填充，避免 sum() 返回无波段图像
+var emptyImage = ee.Image.constant(0).rename('FT_Count_Annual');
+
+// 先计算每年冻融日的总和
+var yearlyFTCounts = ee.ImageCollection.fromImages(
+    // *** 关键修正：将起始年份改为 2010 ***
+    ee.List.sequence(2010, 2023).map(function(year) {
+        var start = ee.Date.fromYMD(year, 1, 1);
+        var end = ee.Date.fromYMD(year, 12, 31);
+        
+        var annualCollection = freezeThawDays.filterDate(start, end);
+
+        // 处理集合为空的情况（避免之前遇到的 Image.unmask 错误）
+        var count = ee.Algorithms.If(
+            annualCollection.size().eq(0),
+            emptyImage,
+            annualCollection.sum().rename('FT_Count_Annual')
+        );
+        return ee.Image(count);
+    })
+);
+
+// 计算多年平均冻融日数
+var meanFreezeThawDays = yearlyFTCounts.mean().clip(boundary).rename('Mean_FT_Days');
+
+// 4. 可视化
+var ftDaysVis = {
+    min: 0,
+    max: 60, 
+    palette: ['#F2F2F2', '#0000FF', '#800080'] 
+};
+Map.addLayer(meanFreezeThawDays, ftDaysVis, 'Mean Freeze-Thaw Days', true); // 设为 true 确保显示
+Map.centerObject(boundary, 10); // 定位到研究区
+
+// 5. 导出数据 (使用 100m 精度)
+Export.image.toDrive({
+    image: meanFreezeThawDays.unmask(NO_DATA_VAL), 
+    description: 'HHG_Mean_FreezeThaw_Days_100m_2010_2023', // 更改描述以反映新日期
+    folder: 'Hehuang_slide',
+    scale: TARGET_SCALE, 
+    region: boundary.geometry(),
+    maxPixels: 1e13,
+    crs: 'EPSG:4326',
+    fileFormat: 'GeoTIFF',
+    formatOptions: {
+        noData: NO_DATA_VAL
+    }
+});
