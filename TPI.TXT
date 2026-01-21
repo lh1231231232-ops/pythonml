@@ -1,0 +1,34 @@
+var boundary = ee.FeatureCollection('projects/my-first-project1-470406/assets/study_scope');
+var roi = boundary.geometry();
+var NO_DATA_VAL = -9999;
+
+var dem = ee.Image('NASA/NASADEM_HGT/001').select('elevation').clip(roi);
+
+// 计算TPI（300m窗口）
+var dem30 = dem.resample('bilinear'); // 仅显示/计算平滑
+var radiusM = 300;
+
+var meanN = dem30.reduceNeighborhood({
+  reducer: ee.Reducer.mean(),
+  kernel: ee.Kernel.circle({radius: radiusM, units: 'meters'})
+});
+
+var tpi = dem30.subtract(meanN).rename('TPI_300m').clip(roi);
+
+Map.centerObject(boundary, 10);
+Map.addLayer(tpi, {min:-50, max:50, palette:['blue','white','red']}, 'TPI');
+
+// ✅ 写死UTM（河湟谷地大概率 47N）
+var UTM = 'EPSG:32647';
+
+Export.image.toDrive({
+  image: tpi.unmask(NO_DATA_VAL),
+  description: 'HHG_TPI_30m_NASADEM_300mWin',
+  folder: 'GEE_Exports',
+  region: roi,
+  crs: UTM,
+  scale: 30,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF',
+  formatOptions: { noData: NO_DATA_VAL }
+});
