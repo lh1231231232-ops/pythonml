@@ -1,0 +1,86 @@
+// 步骤1: 加载断层数据
+var faults = ee.FeatureCollection('users/javier_v/JL_DN_FAULT');  // 断层数据路径
+
+// 步骤2: 所有断层统一设置500米缓冲区
+var bufferDistance = 500;
+var bufferedFaults = faults.map(function(feature) {
+  return feature.buffer(bufferDistance);
+});
+
+// 步骤4: 定义研究区
+var studyArea = ee.FeatureCollection('users/javier_v/southeast_jilin_disater').geometry();  // 研究区几何
+
+// 步骤5: 将缓冲区转换为栅格图像
+// - 断层缓冲区设为1，研究区内其他设为0，研究区外设为NoData
+var faultRaster = ee.Image().paint(bufferedFaults, 1)  // 使用 paint 将缓冲区几何绘制为值为1
+  .unmask(0);  // 研究区内非断层区域设为0
+
+// 将 studyArea 转换为掩膜图像
+var studyAreaMask = ee.Image.constant(1).clip(studyArea);  // 研究区内为1，外部为NoData
+
+// 应用掩膜到 faultRaster，确保研究区外为NoData
+var maskedRaster = faultRaster.updateMask(studyAreaMask);
+
+// 步骤6: 重采样到30m分辨率
+var resampledRaster = maskedRaster
+  .reproject({
+    crs: 'EPSG:4326',  // WGS84
+    scale: 100  // 30m 分辨率
+  })
+  .resample('bicubic');  // 双立方插值，可选 'bilinear'
+
+// 步骤7: 实时显示
+Map.centerObject(studyArea, 10);  // 居中到研究区，缩放级别10
+Map.addLayer(bufferedFaults, {color: 'red'}, 'Buffered Faults 500m (Vector)');  // 全部断层统一500米缓冲区
+Map.addLayer(resampledRaster, {min: 0, max: 1, palette: ['white', 'red']}, 'Resampled Raster (1=Fault, 0=Non-Fault, NoData outside)');  // 合并栅格
+
+// ======================================================================
+// === 9. 计算断层 (FAULT) 的欧氏距离 ===
+// ======================================================================
+
+// 1. 定义源像元：将原始断层线栅格化为源图像
+// 我们将断层线栅格化，确保源像素值为非零（例如 1），以便进行距离计算。
+// 使用 clip(studyArea) 限制栅格化范围。
+var faultSource = ee.Image.constant(0).clip(studyArea)
+    .paint({
+      featureCollection: faults, // 使用原始断层线
+      color: 1,                 // 值为 1 的地方是源
+      width: 1                  // 确保断层线被栅格化
+    })
+    .unmask(0); // 研究区内非断层区域为 0
+
+// 2. 执行快速距离变换
+// fastDistanceTransform 计算的是像素距离的平方 (squared distance in pixels)
+var distanceImagePixels = faultSource.fastDistanceTransform({
+    units: 'pixels' // 修正为 'units'，以像素为单位计算距离
+});
+
+// 3. 转换为米 (meters)
+// 对像素距离取平方根，然后乘以实际的像素大小 (30米)
+var distanceImageMeters = distanceImagePixels.sqrt().multiply(30)
+    .rename('Distance_to_Fault');
+
+// 4. 裁剪到研究区并设置区域外 NoData
+// 将研究区外设置为 -9999 (NoData)
+var distanceFinal = distanceImageMeters.clip(studyArea).unmask(-9999)
+    .toInt16(); // 转换为整数类型便于存储
+
+// === 10. 实时显示欧氏距离 ===
+var distanceViz = {
+    min: 0,
+    max: 10000, // 最大距离设置为 10000 米 (10公里)，请根据实际情况调整
+    palette: ['0000FF', '00FFFF', '00FF00', 'FFFF00', 'FF0000'] // 从近到远：蓝->红
+};
+Map.addLayer(distanceFinal, distanceViz, 'Euclidean Distance to Fault (m)'); 
+
+// === 11. 导出欧氏距离栅格 ===
+Export.image.toDrive({
+    image: distanceFinal,
+    description: 'HH_Fault_Euclidean_Distance_30m',
+    folder: 'GEE_Exports', 
+    fileNamePrefix: 'HH_Fault_Euclidean_Distance_30m',
+    region: studyArea, 
+    scale: 100, // 30m 分辨率
+    crs: 'EPSG:4326', 
+    maxPixels: 1e13 
+});

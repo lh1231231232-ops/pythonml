@@ -1,0 +1,133 @@
+// =========================
+// GEE: 大区域 SPI 提取与导出
+// 目标：
+// 1) 计算 SPI（基于 CHIRPS 日降水聚合）
+// 2) 输出投影为 WGS84（EPSG:4326）、100m 分辨率
+// 3) 在 GEE 中可视化
+// 4) 研究区外 masked 像元替换为 -9999
+// 5) 导出 GeoTIFF 到 Google Drive
+// =========================
+
+// ---------- 1. 研究区（请替换为你的资产） ----------
+// 方式A：使用资产面要素
+var studyArea = ee.FeatureCollection('users/your_username/study_area').geometry();
+
+// 方式B：若你在代码编辑器里手动画了 geometry，可改为：
+// var studyArea = geometry;
+
+Map.centerObject(studyArea, 6);
+
+// ---------- 2. 参数设置 ----------
+var spiScaleMonths = 3; // SPI时间尺度：如1/3/6/12
+var baselineStart = ee.Date('1991-01-01'); // 基准期起始
+var baselineEnd   = ee.Date('2020-12-31'); // 基准期结束
+
+// 目标月份（SPI 输出月份）
+var targetDate = ee.Date('2023-07-01');
+
+// 输出参数
+var outScale = 100;           // 100m
+var outCrs = 'EPSG:4326';     // WGS84
+var nodataValue = -9999;
+
+// ---------- 3. 数据源（CHIRPS 日降水） ----------
+// 说明：GEE 中公开可用的是 DAILY/PENTAD，这里用 DAILY 后按月窗累加。
+var chirpsDaily = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+	.select('precipitation');
+
+// ---------- 4. 计算某月前N个月累计降水 ----------
+function getAccumPrecip(endMonthDate, nMonths) {
+	endMonthDate = ee.Date(endMonthDate);
+	var start = endMonthDate.advance(-(nMonths - 1), 'month');
+	var end = endMonthDate.advance(1, 'month');
+
+	var accum = chirpsDaily
+		.filterDate(start, end)
+		.sum()
+		.rename('P_accum')
+		.set('system:time_start', endMonthDate.millis())
+		.set('month', endMonthDate.get('month'));
+
+	return accum;
+}
+
+// ---------- 5. 构建基准期的累计降水序列 ----------
+var firstValidBaselineMonth = baselineStart.advance(spiScaleMonths - 1, 'month');
+var nBaselineMonths = baselineEnd.difference(firstValidBaselineMonth, 'month').add(1);
+
+var baselineDates = ee.List.sequence(0, nBaselineMonths.subtract(1)).map(function(i) {
+	return firstValidBaselineMonth.advance(ee.Number(i), 'month');
+});
+
+var baselineAccumCol = ee.ImageCollection.fromImages(
+	baselineDates.map(function(d) {
+		return getAccumPrecip(ee.Date(d), spiScaleMonths);
+	})
+);
+
+// ---------- 6. 提取目标月份对应的历史统计（同月均值、标准差） ----------
+var targetMonth = ee.Number(targetDate.get('month'));
+
+var baselineSameMonth = baselineAccumCol.filter(ee.Filter.eq('month', targetMonth));
+var climMean = baselineSameMonth.mean().rename('clim_mean');
+var climStd = baselineSameMonth.reduce(ee.Reducer.stdDev()).rename('clim_std');
+
+// 目标月累计降水
+var targetAccum = getAccumPrecip(targetDate, spiScaleMonths).rename('target_accum');
+
+// SPI = (P - mean) / std
+var spi = targetAccum.subtract(climMean)
+	.divide(climStd.max(0.0001))
+	.rename('SPI_' + spiScaleMonths);
+
+// ---------- 7. 处理范围、投影、NoData ----------
+var spiClipped = spi.clip(studyArea);
+
+// 把研究区外 masked 像元替换为 -9999
+var spiWithNodata = spiClipped
+	.unmask(nodataValue)
+	.toFloat()
+	.reproject({
+		crs: outCrs,
+		scale: outScale
+	});
+
+// ---------- 8. 可视化 ----------
+var vis = {
+	min: -2.5,
+	max: 2.5,
+	palette: [
+		'#8c510a', '#d8b365', '#f6e8c3',
+		'#f5f5f5',
+		'#c7eae5', '#5ab4ac', '#01665e'
+	]
+};
+
+Map.addLayer(spiWithNodata.updateMask(spiWithNodata.neq(nodataValue)), vis,
+	'SPI-' + spiScaleMonths + ' (' + targetDate.format('YYYY-MM').getInfo() + ')');
+Map.addLayer(studyArea, {color: 'red'}, 'Study Area', false);
+
+print('目标月:', targetDate.format('YYYY-MM'));
+print('SPI时间尺度（月）:', spiScaleMonths);
+print('NoData值:', nodataValue);
+
+// ---------- 9. 导出到 Google Drive ----------
+Export.image.toDrive({
+	image: spiWithNodata,
+	description: 'SPI' + spiScaleMonths + '_' + targetDate.format('YYYYMM').getInfo() + '_WGS84_100m',
+	folder: 'GEE_SPI_EXPORT', // 你可以改成自己的Drive文件夹名
+	fileNamePrefix: 'SPI' + spiScaleMonths + '_' + targetDate.format('YYYYMM').getInfo() + '_WGS84_100m',
+	region: studyArea,
+	crs: outCrs,
+	scale: outScale,
+	maxPixels: 1e13,
+	fileFormat: 'GeoTIFF',
+	formatOptions: {
+		cloudOptimized: true,
+		noData: nodataValue
+	}
+});
+
+// 说明：
+// 1) 大区域 + 100m 会非常大，导出时间较长；可先测试更小区域。
+// 2) 如果你需要“逐月批量导出SPI”，可在此脚本基础上加循环批处理。
